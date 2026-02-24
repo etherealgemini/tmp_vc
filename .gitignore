@@ -1,9 +1,3 @@
-# Experiment outputs (generated files; keep directory via .gitkeep)
-outputs/error_norm/*.png
-outputs/error_norm/*.npy
-outputs/error_norm/*.json
-outputs/error_norm/per_layer/
-
 # Byte-compiled / optimized / DLL files
 __pycache__/
 *.py[cod]
