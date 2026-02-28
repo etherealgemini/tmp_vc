@@ -14,7 +14,7 @@ PAD_TOKEN_ID = 0
 
 def _pad_for_block_alignment(
     token_ids: list, image_token_ranges: list, block_size: int,
-) -> tuple[list[int], list[tuple[int, int, int]]]:
+) -> tuple[list[int], list[tuple[int, int, int]], list[tuple[int, int]]]:
     """Pad *token_ids* so that each image's tokens occupy dedicated, complete blocks.
 
     Padding tokens (``PAD_TOKEN_ID``) are inserted:
@@ -26,14 +26,22 @@ def _pad_for_block_alignment(
     contains *only* tokens from that single image (plus deterministic padding),
     enabling position-agnostic cross-request reuse of image KV blocks.
 
-    Returns ``(padded_token_ids, padded_image_token_ranges)`` where the ranges
-    are adjusted to the new, block-aligned positions.
+    Returns ``(padded_token_ids, padded_image_token_ranges, postpad_ranges)`` where:
+
+    * *padded_image_token_ranges* are the ranges adjusted to the new, block-aligned
+      positions.
+    * *postpad_ranges* is a list of ``(start, end)`` half-open intervals in the
+      padded sequence identifying the post-padding tokens appended at the end of
+      each image's last block.  These positions sit inside image KV blocks but
+      carry no real image content; their KV values must **not** be stored so that
+      the KV cache is equivalent before and after image-block reuse.
     """
     if not image_token_ranges:
-        return list(token_ids), []
+        return list(token_ids), [], []
 
     padded: list[int] = []
     padded_ranges: list[tuple[int, int, int]] = []
+    postpad_ranges: list[tuple[int, int]] = []
     src = 0  # next uncopied position in the original token_ids
 
     for img_start, img_end, img_hash in image_token_ranges:
@@ -49,19 +57,27 @@ def _pad_for_block_alignment(
         p_img_start = len(padded)
         padded.extend(token_ids[img_start:img_end])
 
+        # Record the end of the real image tokens before post-padding.
+        real_img_end = len(padded)
+
         # Pad image segment to fill the last block completely.
         remainder = len(padded) % block_size
         if remainder != 0:
             padded.extend([PAD_TOKEN_ID] * (block_size - remainder))
 
         p_img_end = len(padded)
+
+        # Track the post-pad range (may be empty when image already block-aligned).
+        if p_img_end > real_img_end:
+            postpad_ranges.append((real_img_end, p_img_end))
+
         padded_ranges.append((p_img_start, p_img_end, img_hash))
         src = img_end
 
     # --- remaining text after the last image ---
     padded.extend(token_ids[src:])
 
-    return padded, padded_ranges
+    return padded, padded_ranges, postpad_ranges
 
 
 def _compute_image_token_ranges(token_ids: list, image_hashes: list) -> list:
@@ -122,12 +138,21 @@ class Sequence:
         # Pad token_ids so that every image occupies dedicated, complete blocks.
         # This ensures image KV-cache blocks contain only a single image's tokens,
         # enabling cross-request reuse regardless of surrounding text.
+        # image_postpad_ranges records the half-open (start, end) intervals of the
+        # post-padding tokens appended to the last block of each image.  These
+        # positions must never have their KV values stored so that image KV blocks
+        # contain only real image token KV, making cache usage equivalent before
+        # and after reuse.
         if self.image_token_ranges:
-            self.token_ids, self.image_token_ranges = _pad_for_block_alignment(
-                self.token_ids, self.image_token_ranges, self.block_size,
+            self.token_ids, self.image_token_ranges, self.image_postpad_ranges = (
+                _pad_for_block_alignment(
+                    self.token_ids, self.image_token_ranges, self.block_size,
+                )
             )
             self.num_tokens = len(self.token_ids)
             self.num_prompt_tokens = self.num_tokens
+        else:
+            self.image_postpad_ranges: list[tuple[int, int]] = []
 
         # Block indices (within this sequence's block_table) that were reused from
         # the KV cache via image-content hash even though the text prefix before
@@ -173,6 +198,22 @@ class Sequence:
     def last_block_num_tokens(self):
         return self.num_tokens - (self.num_blocks - 1) * self.block_size
 
+    @property
+    def image_postpad_count(self) -> int:
+        """Total number of post-padding tokens appended inside image KV blocks.
+
+        These tokens fill the last block of each image to a multiple of
+        ``block_size`` for cache-reuse alignment but carry no real image
+        content.  Their KV values are never stored, so the KV cache used
+        before and after image-block reuse remains equivalent.
+        """
+        return sum(e - s for s, e in self.image_postpad_ranges)
+
+    @property
+    def num_effective_tokens(self) -> int:
+        """Number of tokens excluding image-block post-padding."""
+        return self.num_tokens - self.image_postpad_count
+
     def block(self, i):
         assert 0 <= i < self.num_blocks
         return self.token_ids[i*self.block_size: (i+1)*self.block_size]
@@ -195,25 +236,37 @@ class Sequence:
         return (self.num_tokens, self.num_prompt_tokens, self.num_cached_tokens, self.block_table,
                 self.token_ids if self.num_completion_tokens == 0 else self.last_token,
                 self.mm_inputs, self.start_time, self.vit_time, self.ttft, self.image_hashes,
-                self.image_reused_blocks)
+                self.image_reused_blocks, self.image_postpad_ranges)
 
     def __setstate__(self, state):
-        if len(state) == 11:
+        # Each branch corresponds to a historical state tuple length.
+        # v5 (len=12): adds image_postpad_ranges (this PR).
+        # v4 (len=11): adds image_reused_blocks.
+        # v3 (len=10): adds image_hashes.
+        # v2 (len=9):  adds start_time, vit_time, ttft.
+        # v1 (len=6):  original format.
+        if len(state) == 12:          # v5
+            (self.num_tokens, self.num_prompt_tokens, self.num_cached_tokens, self.block_table,
+             token_data, self.mm_inputs, self.start_time, self.vit_time, self.ttft,
+             self.image_hashes, self.image_reused_blocks, self.image_postpad_ranges) = state
+        elif len(state) == 11:        # v4
             (self.num_tokens, self.num_prompt_tokens, self.num_cached_tokens, self.block_table,
              token_data, self.mm_inputs, self.start_time, self.vit_time, self.ttft,
              self.image_hashes, self.image_reused_blocks) = state
-        elif len(state) == 10:
+            self.image_postpad_ranges = []
+        elif len(state) == 10:        # v3
             (self.num_tokens, self.num_prompt_tokens, self.num_cached_tokens, self.block_table,
              token_data, self.mm_inputs, self.start_time, self.vit_time, self.ttft,
              self.image_hashes) = state
             self.image_reused_blocks = set()
-        elif len(state) == 9:
+            self.image_postpad_ranges = []
+        elif len(state) == 9:         # v2
             (self.num_tokens, self.num_prompt_tokens, self.num_cached_tokens, self.block_table,
              token_data, self.mm_inputs, self.start_time, self.vit_time, self.ttft) = state
             self.image_hashes = None
             self.image_reused_blocks = set()
-        else:
-            # Backward compatibility
+            self.image_postpad_ranges = []
+        else:                         # v1 (len=6)
             (self.num_tokens, self.num_prompt_tokens, self.num_cached_tokens, self.block_table,
              token_data, self.mm_inputs) = state
             self.start_time = time.time()
@@ -221,6 +274,7 @@ class Sequence:
             self.ttft = 0.0
             self.image_hashes = None
             self.image_reused_blocks = set()
+            self.image_postpad_ranges = []
 
         # image_token_ranges is only needed in BlockManager (scheduler process);
         # worker model-runner processes only need image_reused_blocks.
