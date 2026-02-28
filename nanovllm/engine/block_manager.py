@@ -54,7 +54,49 @@ class BlockManager:
         self.free_block_ids.append(block_id)
 
     def can_allocate(self, seq: Sequence) -> bool:
-        return len(self.free_block_ids) >= seq.num_blocks
+        return len(self.free_block_ids) >= self._count_required_free_blocks(seq)
+
+    def _count_required_free_blocks(self, seq: Sequence) -> int:
+        h = -1
+        text_cache_miss = False
+        required_free_blocks = 0
+        image_token_ranges = getattr(seq, 'image_token_ranges', [])
+
+        for i in range(seq.num_blocks):
+            block_start = i * self.block_size
+            token_ids = seq.block(i)
+            full_block = len(token_ids) == self.block_size
+            img_content_hash = None
+            is_first_of_image = False
+            if full_block and image_token_ranges:
+                block_end = block_start + self.block_size
+                for (img_start, img_end, img_hash) in image_token_ranges:
+                    if block_start >= img_start and block_end <= img_end:
+                        img_content_hash = img_hash
+                        is_first_of_image = (block_start == img_start)
+                        break
+            if img_content_hash is not None:
+                if is_first_of_image:
+                    h = img_content_hash
+                h = self.compute_hash(token_ids, h)
+            else:
+                h = self.compute_hash(token_ids, h) if full_block else -1
+
+            block_id = self.hash_to_block_id.get(h, -1)
+            cache_hit = block_id != -1 and self.blocks[block_id].token_ids == token_ids
+            block_is_used = block_id in self.used_block_ids
+
+            if img_content_hash is not None:
+                if cache_hit and block_is_used:
+                    continue
+                required_free_blocks += 1
+            elif cache_hit and not text_cache_miss:
+                if not block_is_used:
+                    required_free_blocks += 1
+            else:
+                text_cache_miss = True
+                required_free_blocks += 1
+        return required_free_blocks
 
     def allocate(self, seq: Sequence):
         assert not seq.block_table
