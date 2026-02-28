@@ -59,6 +59,7 @@ class LLMEngine:
         seqs, is_prefill = self.scheduler.schedule()
         token_ids, vit_time = self.model_runner.call("run", seqs, is_prefill)
         if is_prefill:
+            self._compact_padding(seqs)
             now = time()
             for seq in seqs:
                 if seq.mm_inputs:
@@ -68,6 +69,21 @@ class LLMEngine:
         outputs = [seq for seq in seqs if seq.is_finished]
         num_tokens = sum(len(seq) for seq in seqs) if is_prefill else -len(seqs)
         return outputs, num_tokens
+
+    def _compact_padding(self, seqs):
+        """Remove image block-alignment padding from KV cache after prefill."""
+        bm = self.scheduler.block_manager
+        kv_ops = []
+        plans = []
+        for seq in seqs:
+            plan = bm.plan_compact(seq)
+            if plan:
+                kv_ops.append((plan['src_slots'], plan['dst_slots']))
+                plans.append((seq, plan))
+        if kv_ops:
+            self.model_runner.call("compact_kv", kv_ops)
+            for seq, plan in plans:
+                bm.apply_compact(seq, plan)
 
     def is_finished(self):
         return self.scheduler.is_finished()

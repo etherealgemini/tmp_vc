@@ -14,7 +14,7 @@ PAD_TOKEN_ID = 0
 
 def _pad_for_block_alignment(
     token_ids: list, image_token_ranges: list, block_size: int,
-) -> tuple[list[int], list[tuple[int, int, int]]]:
+) -> tuple[list[int], list[tuple[int, int, int]], set[int]]:
     """Pad *token_ids* so that each image's tokens occupy dedicated, complete blocks.
 
     Padding tokens (``PAD_TOKEN_ID``) are inserted:
@@ -26,14 +26,16 @@ def _pad_for_block_alignment(
     contains *only* tokens from that single image (plus deterministic padding),
     enabling position-agnostic cross-request reuse of image KV blocks.
 
-    Returns ``(padded_token_ids, padded_image_token_ranges)`` where the ranges
-    are adjusted to the new, block-aligned positions.
+    Returns ``(padded_token_ids, padded_image_token_ranges, padding_positions)``
+    where the ranges are adjusted to the new, block-aligned positions and
+    *padding_positions* is a set of indices in *padded_token_ids* that are padding.
     """
     if not image_token_ranges:
-        return list(token_ids), []
+        return list(token_ids), [], set()
 
     padded: list[int] = []
     padded_ranges: list[tuple[int, int, int]] = []
+    padding_positions: set[int] = set()
     src = 0  # next uncopied position in the original token_ids
 
     for img_start, img_end, img_hash in image_token_ranges:
@@ -43,7 +45,10 @@ def _pad_for_block_alignment(
         # Pad text segment to the next block boundary so the image starts clean.
         remainder = len(padded) % block_size
         if remainder != 0:
-            padded.extend([PAD_TOKEN_ID] * (block_size - remainder))
+            pad_start = len(padded)
+            pad_count = block_size - remainder
+            padded.extend([PAD_TOKEN_ID] * pad_count)
+            padding_positions.update(range(pad_start, pad_start + pad_count))
 
         # --- image segment ---
         p_img_start = len(padded)
@@ -52,7 +57,10 @@ def _pad_for_block_alignment(
         # Pad image segment to fill the last block completely.
         remainder = len(padded) % block_size
         if remainder != 0:
-            padded.extend([PAD_TOKEN_ID] * (block_size - remainder))
+            pad_start = len(padded)
+            pad_count = block_size - remainder
+            padded.extend([PAD_TOKEN_ID] * pad_count)
+            padding_positions.update(range(pad_start, pad_start + pad_count))
 
         p_img_end = len(padded)
         padded_ranges.append((p_img_start, p_img_end, img_hash))
@@ -61,7 +69,7 @@ def _pad_for_block_alignment(
     # --- remaining text after the last image ---
     padded.extend(token_ids[src:])
 
-    return padded, padded_ranges
+    return padded, padded_ranges, padding_positions
 
 
 def _compute_image_token_ranges(token_ids: list, image_hashes: list) -> list:
@@ -119,11 +127,15 @@ class Sequence:
             if image_hashes else []
         )
 
+        # Positions in the padded token_ids that are block-alignment padding.
+        # Populated by _pad_for_block_alignment; cleared after KV compaction.
+        self.padding_positions: set[int] = set()
+
         # Pad token_ids so that every image occupies dedicated, complete blocks.
         # This ensures image KV-cache blocks contain only a single image's tokens,
         # enabling cross-request reuse regardless of surrounding text.
         if self.image_token_ranges:
-            self.token_ids, self.image_token_ranges = _pad_for_block_alignment(
+            self.token_ids, self.image_token_ranges, self.padding_positions = _pad_for_block_alignment(
                 self.token_ids, self.image_token_ranges, self.block_size,
             )
             self.num_tokens = len(self.token_ids)
@@ -186,6 +198,24 @@ class Sequence:
             h ^= x
         return h
 
+    def get_non_padding_indices(self) -> list[int]:
+        """Return sorted list of non-padding token positions in the padded token_ids."""
+        if not self.padding_positions:
+            return list(range(self.num_tokens))
+        return sorted(set(range(self.num_tokens)) - self.padding_positions)
+
+    def apply_compaction(self, new_block_table: list[int]):
+        """Update sequence metadata after KV cache compaction removes padding."""
+        non_padding = self.get_non_padding_indices()
+        self.token_ids = [self.token_ids[i] for i in non_padding]
+        self.num_tokens = len(self.token_ids)
+        self.num_prompt_tokens = self.num_tokens
+        self.num_cached_tokens = self.num_tokens
+        self.block_table = new_block_table
+        self.padding_positions = set()
+        self.image_token_ranges = []
+        self.image_reused_blocks = set()
+
     def append_token(self, token_id: int):
         self.token_ids.append(token_id)
         self.last_token = token_id
@@ -225,6 +255,9 @@ class Sequence:
         # image_token_ranges is only needed in BlockManager (scheduler process);
         # worker model-runner processes only need image_reused_blocks.
         self.image_token_ranges = []
+        # padding_positions is only needed in the scheduler process for compaction
+        # planning; it is cleared after compaction and not serialized.
+        self.padding_positions = set()
 
         if self.num_completion_tokens == 0:
             self.token_ids = token_data

@@ -149,6 +149,79 @@ class BlockManager:
         seq.block_table.clear()
         seq.image_reused_blocks.clear()
 
+    def plan_compact(self, seq: Sequence):
+        """Plan KV-cache compaction that removes block-alignment padding.
+
+        Returns a dict with ``src_slots``, ``dst_slots``, and ``new_block_ids``
+        or *None* if no compaction is needed or there are not enough free blocks.
+        """
+        if not getattr(seq, 'padding_positions', None):
+            return None
+
+        non_padding = seq.get_non_padding_indices()
+        num_unpadded = len(non_padding)
+        new_num_blocks = (num_unpadded + self.block_size - 1) // self.block_size
+
+        if len(self.free_block_ids) < new_num_blocks:
+            return None
+
+        # Source slots (physical KV-cache positions in the padded layout)
+        src_slots = []
+        for idx in non_padding:
+            block_idx = idx // self.block_size
+            offset = idx % self.block_size
+            physical_block = seq.block_table[block_idx]
+            src_slots.append(physical_block * self.block_size + offset)
+
+        # Allocate fresh blocks for the compacted layout
+        new_block_ids = []
+        for _ in range(new_num_blocks):
+            block_id = self.free_block_ids[0]
+            self._allocate_block(block_id)
+            new_block_ids.append(block_id)
+
+        # Destination slots (contiguous positions in the new blocks)
+        dst_slots = []
+        for j in range(num_unpadded):
+            block_idx = j // self.block_size
+            offset = j % self.block_size
+            physical_block = new_block_ids[block_idx]
+            dst_slots.append(physical_block * self.block_size + offset)
+
+        return {
+            'src_slots': src_slots,
+            'dst_slots': dst_slots,
+            'new_block_ids': new_block_ids,
+        }
+
+    def apply_compact(self, seq: Sequence, plan: dict):
+        """Finalize compaction: free old blocks, update sequence metadata and
+        rebuild the hash chain for the compacted blocks."""
+        old_block_ids = list(seq.block_table)
+
+        # Release old blocks (shared image blocks may survive with ref_count > 0)
+        for block_id in old_block_ids:
+            block = self.blocks[block_id]
+            block.ref_count -= 1
+            if block.ref_count == 0:
+                self._deallocate_block(block_id)
+
+        # Update sequence metadata (token_ids, num_tokens, block_table, etc.)
+        seq.apply_compaction(plan['new_block_ids'])
+
+        # Rebuild hash chain for all full compacted blocks so that may_append
+        # works correctly when the last block fills up during decode.
+        h = -1
+        for i in range(seq.num_blocks):
+            token_ids = seq.block(i)
+            if len(token_ids) == self.block_size:
+                h = self.compute_hash(token_ids, h)
+                block_id = seq.block_table[i]
+                self.blocks[block_id].update(h, token_ids)
+                self.hash_to_block_id[h] = block_id
+            else:
+                h = -1
+
     def can_append(self, seq: Sequence) -> bool:
         return len(self.free_block_ids) >= (len(seq) % self.block_size == 1)
 
