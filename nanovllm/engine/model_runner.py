@@ -342,6 +342,28 @@ class ModelRunner:
         return token_ids, vit_time
 
     @torch.inference_mode()
+    def compact_kv(self, kv_ops: list):
+        """Move KV-cache entries to remove block-alignment padding gaps.
+
+        *kv_ops* is a list of ``(src_slots, dst_slots)`` pairs where each is a
+        list of physical slot indices in the KV cache.
+        """
+        for src_slots, dst_slots in kv_ops:
+            if not src_slots:
+                continue
+            src = torch.tensor(src_slots, dtype=torch.long, device='cuda')
+            dst = torch.tensor(dst_slots, dtype=torch.long, device='cuda')
+            for layer_idx in range(self.kv_cache.shape[1]):
+                k_cache = self.kv_cache[0, layer_idx]
+                v_cache = self.kv_cache[1, layer_idx]
+                flat_k = k_cache.view(-1, *k_cache.shape[2:])
+                flat_v = v_cache.view(-1, *v_cache.shape[2:])
+                k_data = flat_k[src].clone()
+                v_data = flat_v[src].clone()
+                flat_k[dst] = k_data
+                flat_v[dst] = v_data
+
+    @torch.inference_mode()
     def capture_cudagraph(self):
         config = self.config
         hf_config = config.hf_config

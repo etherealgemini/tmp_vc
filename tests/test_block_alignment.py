@@ -53,9 +53,10 @@ class TestPadForBlockAlignment:
     def test_no_images(self):
         """Without images, token_ids should be returned unchanged."""
         tokens = _txt(10)
-        padded, ranges = _pad_for_block_alignment(tokens, [], BLOCK)
+        padded, ranges, pad_pos = _pad_for_block_alignment(tokens, [], BLOCK)
         assert padded == tokens
         assert ranges == []
+        assert pad_pos == set()
 
     def test_single_image_aligned_start(self):
         """Image starting on a block boundary needs no pre-padding."""
@@ -63,7 +64,7 @@ class TestPadForBlockAlignment:
         img = _img(BLOCK)   # fills exactly one block
         tokens = text + img
         raw_ranges = _compute_image_token_ranges(tokens, [0xABC])
-        padded, pranges = _pad_for_block_alignment(tokens, raw_ranges, BLOCK)
+        padded, pranges, pad_pos = _pad_for_block_alignment(tokens, raw_ranges, BLOCK)
 
         # No padding needed – already aligned.
         assert padded == tokens
@@ -72,6 +73,7 @@ class TestPadForBlockAlignment:
         assert start == BLOCK
         assert end == 2 * BLOCK
         assert h == 0xABC
+        assert pad_pos == set()
 
     def test_single_image_unaligned_start(self):
         """Image NOT on a block boundary must be padded before."""
@@ -80,7 +82,7 @@ class TestPadForBlockAlignment:
         trailing = _txt(3, 100)  # some text after
         tokens = text + img + trailing
         raw_ranges = _compute_image_token_ranges(tokens, [0xABC])
-        padded, pranges = _pad_for_block_alignment(tokens, raw_ranges, BLOCK)
+        padded, pranges, pad_pos = _pad_for_block_alignment(tokens, raw_ranges, BLOCK)
 
         # Pre-padding: 16 - 10 = 6 PAD tokens before image
         expected_pre_pad = BLOCK - 10
@@ -102,7 +104,7 @@ class TestPadForBlockAlignment:
         img = _img(20)  # 20 tokens → needs 2 blocks (16 + 4 → pad 12)
         tokens = text + img
         raw_ranges = _compute_image_token_ranges(tokens, [0xDEF])
-        padded, pranges = _pad_for_block_alignment(tokens, raw_ranges, BLOCK)
+        padded, pranges, pad_pos = _pad_for_block_alignment(tokens, raw_ranges, BLOCK)
 
         start, end, h = pranges[0]
         assert start == BLOCK            # image starts at block boundary
@@ -123,7 +125,7 @@ class TestPadForBlockAlignment:
         text3 = _txt(4, 100)
         tokens = text1 + img1 + text2 + img2 + text3
         raw_ranges = _compute_image_token_ranges(tokens, [0xA, 0xB])
-        padded, pranges = _pad_for_block_alignment(tokens, raw_ranges, BLOCK)
+        padded, pranges, pad_pos = _pad_for_block_alignment(tokens, raw_ranges, BLOCK)
 
         # Image 1
         s1, e1, h1 = pranges[0]
@@ -151,7 +153,7 @@ class TestPadForBlockAlignment:
         # (all the same token value), so it produces only 1 range consuming hash 0xA.
         assert len(raw_ranges) == 1
 
-        padded, pranges = _pad_for_block_alignment(tokens, raw_ranges, BLOCK)
+        padded, pranges, pad_pos = _pad_for_block_alignment(tokens, raw_ranges, BLOCK)
         assert len(pranges) == 1
         for s, e, _ in pranges:
             assert s % BLOCK == 0
@@ -163,7 +165,7 @@ class TestPadForBlockAlignment:
         text = _txt(5)
         tokens = img + text
         raw_ranges = _compute_image_token_ranges(tokens, [0x1])
-        padded, pranges = _pad_for_block_alignment(tokens, raw_ranges, BLOCK)
+        padded, pranges, pad_pos = _pad_for_block_alignment(tokens, raw_ranges, BLOCK)
 
         start, end, _ = pranges[0]
         assert start == 0  # no pre-padding needed
@@ -175,7 +177,7 @@ class TestPadForBlockAlignment:
         img = _img(20)
         tokens = text + img
         raw_ranges = _compute_image_token_ranges(tokens, [0x2])
-        padded, pranges = _pad_for_block_alignment(tokens, raw_ranges, BLOCK)
+        padded, pranges, pad_pos = _pad_for_block_alignment(tokens, raw_ranges, BLOCK)
 
         start, end, _ = pranges[0]
         assert start % BLOCK == 0
@@ -282,6 +284,172 @@ class TestBlockManagerImageReuse:
         seq.block_size = BS
         bm.allocate(seq)
         assert len(seq.block_table) == seq.num_blocks
+        Sequence.block_size = old_bs
+
+
+# ---- KV-cache compaction tests -----------------------------------------------
+
+class TestKVCacheCompaction:
+    """Verify that plan_compact / apply_compact strip padding correctly."""
+
+    @staticmethod
+    def _make_seq(token_ids, image_hashes=None, block_size=BLOCK):
+        old_bs = Sequence.block_size
+        Sequence.block_size = block_size
+        seq = Sequence(token_ids, image_hashes=image_hashes)
+        Sequence.block_size = old_bs
+        seq.block_size = block_size
+        return seq
+
+    def test_padding_positions_tracked(self):
+        """_pad_for_block_alignment should return correct padding positions."""
+        text = _txt(10)
+        img = _img(BLOCK)
+        trailing = _txt(3, 100)
+        tokens = text + img + trailing
+        raw_ranges = _compute_image_token_ranges(tokens, [0xABC])
+        padded, pranges, pad_pos = _pad_for_block_alignment(tokens, raw_ranges, BLOCK)
+
+        # Pre-padding: positions 10..15 (6 PAD tokens)
+        expected_pre = set(range(10, BLOCK))
+        assert expected_pre.issubset(pad_pos)
+        # No post-padding (16 image tokens fill exactly 1 block)
+        assert pad_pos == expected_pre
+
+    def test_padding_positions_with_post_pad(self):
+        """Post-padding positions should be tracked too."""
+        text = _txt(BLOCK)
+        img = _img(20)  # 20 tokens → pad 12 after
+        tokens = text + img
+        raw_ranges = _compute_image_token_ranges(tokens, [0xDEF])
+        padded, pranges, pad_pos = _pad_for_block_alignment(tokens, raw_ranges, BLOCK)
+
+        # Image occupies blocks 1-2 (positions 16-47)
+        # Post-padding at 36..47 (12 PAD tokens)
+        expected_post = set(range(BLOCK + 20, 3 * BLOCK))
+        assert pad_pos == expected_post
+
+    def test_no_padding_no_compaction(self):
+        """Sequences without padding should not produce a compaction plan."""
+        BS = BLOCK
+        NUM_BLOCKS = 32
+        bm = BlockManager(NUM_BLOCKS, BS)
+        tokens = _txt(30)
+        seq = self._make_seq(tokens, block_size=BS)
+        bm.allocate(seq)
+        plan = bm.plan_compact(seq)
+        assert plan is None
+
+    def test_aligned_image_no_compaction(self):
+        """Image already block-aligned needs no compaction."""
+        BS = BLOCK
+        NUM_BLOCKS = 32
+        bm = BlockManager(NUM_BLOCKS, BS)
+        tokens = _txt(BS) + _img(BS)
+        seq = self._make_seq(tokens, image_hashes=[0xABC], block_size=BS)
+        bm.allocate(seq)
+        plan = bm.plan_compact(seq)
+        assert plan is None
+
+    def test_compact_removes_padding(self):
+        """After compaction, seq.num_tokens should equal the original unpadded count."""
+        BS = BLOCK
+        NUM_BLOCKS = 64
+        bm = BlockManager(NUM_BLOCKS, BS)
+        text = _txt(10)
+        img = _img(20)
+        trailing = _txt(3, 100)
+        original_tokens = text + img + trailing
+        original_len = len(original_tokens)  # 33
+
+        seq = self._make_seq(original_tokens, image_hashes=[0xCAFE], block_size=BS)
+        padded_len = len(seq)
+        assert padded_len > original_len  # padding was added
+
+        bm.allocate(seq)
+        plan = bm.plan_compact(seq)
+        assert plan is not None
+
+        # Verify slot counts match
+        assert len(plan['src_slots']) == original_len
+        assert len(plan['dst_slots']) == original_len
+
+        bm.apply_compact(seq, plan)
+
+        # After compaction: length equals original, no padding
+        assert seq.num_tokens == original_len
+        assert seq.num_prompt_tokens == original_len
+        assert len(seq.token_ids) == original_len
+        assert seq.padding_positions == set()
+        assert seq.image_token_ranges == []
+        assert seq.image_reused_blocks == set()
+
+        # Token content matches original (text + image + trailing, no PAD)
+        assert seq.token_ids == original_tokens
+
+        # Block table has correct number of blocks
+        expected_blocks = (original_len + BS - 1) // BS
+        assert len(seq.block_table) == expected_blocks
+
+    def test_compact_hash_chain_valid(self):
+        """After compaction, full blocks should have valid hashes for may_append."""
+        BS = BLOCK
+        NUM_BLOCKS = 64
+        bm = BlockManager(NUM_BLOCKS, BS)
+        # Craft a sequence whose compacted length is exactly a multiple of BS
+        # so that the last block is full and its hash must be set.
+        text = _txt(10)
+        img = _img(BS)  # 16 image tokens
+        trailing = _txt(6, 100)  # 10 + 16 + 6 = 32 = 2 * BS
+        tokens = text + img + trailing
+        seq = self._make_seq(tokens, image_hashes=[0xBEEF], block_size=BS)
+        bm.allocate(seq)
+        plan = bm.plan_compact(seq)
+        assert plan is not None
+        bm.apply_compact(seq, plan)
+
+        assert seq.num_tokens == 32
+        assert seq.num_tokens % BS == 0  # exactly 2 full blocks
+
+        # Both compacted blocks should have valid hashes
+        for i in range(seq.num_blocks):
+            block_id = seq.block_table[i]
+            assert bm.blocks[block_id].hash != -1
+
+    def test_compact_with_image_reuse(self):
+        """Compaction works even when image blocks are shared (reused from cache)."""
+        BS = BLOCK
+        NUM_BLOCKS = 64
+        bm = BlockManager(NUM_BLOCKS, BS)
+        old_bs = Sequence.block_size
+        Sequence.block_size = BS
+        img_hash = 0xBEEF
+
+        # Request 1: creates image blocks in cache
+        tokens1 = _txt(5) + _img(BS) + _txt(3, 100)
+        seq1 = Sequence(tokens1, image_hashes=[img_hash])
+        seq1.block_size = BS
+        bm.allocate(seq1)
+        original_len1 = 5 + BS + 3  # 24
+
+        plan1 = bm.plan_compact(seq1)
+        assert plan1 is not None
+        bm.apply_compact(seq1, plan1)
+        assert seq1.num_tokens == original_len1
+
+        # Request 2: different text, same image → image blocks reused
+        tokens2 = _txt(10, start=500) + _img(BS) + _txt(2, 200)
+        seq2 = Sequence(tokens2, image_hashes=[img_hash])
+        seq2.block_size = BS
+        bm.allocate(seq2)
+        original_len2 = 10 + BS + 2  # 28
+
+        plan2 = bm.plan_compact(seq2)
+        assert plan2 is not None
+        bm.apply_compact(seq2, plan2)
+        assert seq2.num_tokens == original_len2
+        assert seq2.token_ids == _txt(10, start=500) + _img(BS) + _txt(2, 200)
+
         Sequence.block_size = old_bs
 
 
