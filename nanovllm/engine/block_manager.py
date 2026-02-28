@@ -155,7 +155,7 @@ class BlockManager:
         Returns a dict with ``src_slots``, ``dst_slots``, and ``new_block_ids``
         or *None* if no compaction is needed or there are not enough free blocks.
         """
-        if not getattr(seq, 'padding_positions', None):
+        if not seq.padding_positions:
             return None
 
         non_padding = seq.get_non_padding_indices()
