@@ -17,6 +17,10 @@ class Config:
     kvcache_block_size: int = 256
     num_kvcache_blocks: int = -1
     encoder_cache_ratio: float = 0.2
+    # Fraction of image tokens that may be recomputed instead of served from the
+    # encoder cache.  0.0 means full cache reuse (no recomputation); 1.0 means
+    # always recompute.  Valid range: [0.0, 1.0].
+    recompute_ratio: float = 0.0
 
     def __post_init__(self):
         assert os.path.isdir(self.model)
