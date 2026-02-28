@@ -128,7 +128,7 @@ class ModelRunner:
         )
         config.num_kvcache_blocks = int(kv_memory) // kv_block_bytes
         assert config.num_kvcache_blocks > 0
-        self.kv_cache = torch.empty(2, hf_config.num_hidden_layers, config.num_kvcache_blocks, self.block_size, num_kv_heads, head_dim)
+        self.kv_cache = torch.zeros(2, hf_config.num_hidden_layers, config.num_kvcache_blocks, self.block_size, num_kv_heads, head_dim)
         layer_id = 0
         for module in self.model.modules():
             if hasattr(module, "k_cache") and hasattr(module, "v_cache"):
@@ -191,6 +191,13 @@ class ModelRunner:
             image_reused = seq.image_reused_blocks
             if image_reused:
                 has_image_reused = True
+            # Build a set of post-padding positions for this sequence so that
+            # their KV values are never stored.  Keeping these slots at zero
+            # (from the zero-initialized KV cache) ensures the KV cache
+            # behaviour is equivalent whether image blocks are fresh or reused.
+            postpad_positions = set()
+            for ps, pe in getattr(seq, 'image_postpad_ranges', []):
+                postpad_positions.update(range(ps, pe))
             for i in range(seq.num_cached_blocks, seq.num_blocks):
                 start = seq.block_table[i] * self.block_size
                 if i != seq.num_blocks - 1:
@@ -202,6 +209,15 @@ class ModelRunner:
                     # image content.  Use -1 sentinel so store_kvcache skips these
                     # slots and the cached KV values are preserved for attention.
                     slot_mapping.extend([-1] * (end - start))
+                elif postpad_positions:
+                    # For fresh image blocks, skip storing KV for post-pad slots so
+                    # they remain zero, matching the behaviour on cache-reuse paths.
+                    seq_block_start = i * self.block_size
+                    for j, phys_slot in enumerate(range(start, end)):
+                        if seq_block_start + j in postpad_positions:
+                            slot_mapping.append(-1)
+                        else:
+                            slot_mapping.append(phys_slot)
                 else:
                     slot_mapping.extend(list(range(start, end)))
         # Need block_tables whenever there is a contiguous prefix cache OR

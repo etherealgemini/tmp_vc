@@ -1,4 +1,5 @@
 """Tests for image-token block-alignment padding and KV cache block allocation."""
+import pickle
 import sys
 import os
 import importlib.util
@@ -53,9 +54,10 @@ class TestPadForBlockAlignment:
     def test_no_images(self):
         """Without images, token_ids should be returned unchanged."""
         tokens = _txt(10)
-        padded, ranges = _pad_for_block_alignment(tokens, [], BLOCK)
+        padded, ranges, postpad_ranges = _pad_for_block_alignment(tokens, [], BLOCK)
         assert padded == tokens
         assert ranges == []
+        assert postpad_ranges == []
 
     def test_single_image_aligned_start(self):
         """Image starting on a block boundary needs no pre-padding."""
@@ -63,7 +65,7 @@ class TestPadForBlockAlignment:
         img = _img(BLOCK)   # fills exactly one block
         tokens = text + img
         raw_ranges = _compute_image_token_ranges(tokens, [0xABC])
-        padded, pranges = _pad_for_block_alignment(tokens, raw_ranges, BLOCK)
+        padded, pranges, postpad_ranges = _pad_for_block_alignment(tokens, raw_ranges, BLOCK)
 
         # No padding needed – already aligned.
         assert padded == tokens
@@ -72,6 +74,8 @@ class TestPadForBlockAlignment:
         assert start == BLOCK
         assert end == 2 * BLOCK
         assert h == 0xABC
+        # Image is exactly block-aligned, so no post-padding.
+        assert postpad_ranges == []
 
     def test_single_image_unaligned_start(self):
         """Image NOT on a block boundary must be padded before."""
@@ -80,7 +84,7 @@ class TestPadForBlockAlignment:
         trailing = _txt(3, 100)  # some text after
         tokens = text + img + trailing
         raw_ranges = _compute_image_token_ranges(tokens, [0xABC])
-        padded, pranges = _pad_for_block_alignment(tokens, raw_ranges, BLOCK)
+        padded, pranges, postpad_ranges = _pad_for_block_alignment(tokens, raw_ranges, BLOCK)
 
         # Pre-padding: 16 - 10 = 6 PAD tokens before image
         expected_pre_pad = BLOCK - 10
@@ -95,6 +99,8 @@ class TestPadForBlockAlignment:
 
         # Trailing text follows immediately (no extra padding after image)
         assert padded[end:end + 3] == trailing
+        # Image is exactly block-aligned (BLOCK tokens), so no post-padding.
+        assert postpad_ranges == []
 
     def test_image_not_filling_block(self):
         """Image whose token count is not a multiple of block_size gets post-padding."""
@@ -102,7 +108,7 @@ class TestPadForBlockAlignment:
         img = _img(20)  # 20 tokens → needs 2 blocks (16 + 4 → pad 12)
         tokens = text + img
         raw_ranges = _compute_image_token_ranges(tokens, [0xDEF])
-        padded, pranges = _pad_for_block_alignment(tokens, raw_ranges, BLOCK)
+        padded, pranges, postpad_ranges = _pad_for_block_alignment(tokens, raw_ranges, BLOCK)
 
         start, end, h = pranges[0]
         assert start == BLOCK            # image starts at block boundary
@@ -113,6 +119,11 @@ class TestPadForBlockAlignment:
         # Second image block: 4 IMAGE tokens + 12 PAD tokens
         assert padded[start + BLOCK:start + BLOCK + 4] == _img(4)
         assert padded[start + BLOCK + 4:end] == [PAD_TOKEN_ID] * 12
+        # Post-padding covers the 12 PAD tokens at the end of the last image block.
+        assert len(postpad_ranges) == 1
+        ps, pe = postpad_ranges[0]
+        assert ps == start + BLOCK + 4   # real image tokens end here
+        assert pe == end                 # post-pad extends to block boundary
 
     def test_two_images_separated_by_text(self):
         """Two images separated by text should each get their own block range."""
@@ -123,7 +134,7 @@ class TestPadForBlockAlignment:
         text3 = _txt(4, 100)
         tokens = text1 + img1 + text2 + img2 + text3
         raw_ranges = _compute_image_token_ranges(tokens, [0xA, 0xB])
-        padded, pranges = _pad_for_block_alignment(tokens, raw_ranges, BLOCK)
+        padded, pranges, postpad_ranges = _pad_for_block_alignment(tokens, raw_ranges, BLOCK)
 
         # Image 1
         s1, e1, h1 = pranges[0]
@@ -139,6 +150,8 @@ class TestPadForBlockAlignment:
 
         # Ranges don't overlap
         assert e1 <= s2
+        # Both images are exactly BLOCK tokens, so no post-padding expected.
+        assert postpad_ranges == []
 
     def test_adjacent_images(self):
         """Two images with no text in between still get separate block ranges."""
@@ -151,11 +164,13 @@ class TestPadForBlockAlignment:
         # (all the same token value), so it produces only 1 range consuming hash 0xA.
         assert len(raw_ranges) == 1
 
-        padded, pranges = _pad_for_block_alignment(tokens, raw_ranges, BLOCK)
+        padded, pranges, postpad_ranges = _pad_for_block_alignment(tokens, raw_ranges, BLOCK)
         assert len(pranges) == 1
         for s, e, _ in pranges:
             assert s % BLOCK == 0
             assert e % BLOCK == 0
+        # Combined image is exactly 2*BLOCK tokens, no post-padding needed.
+        assert postpad_ranges == []
 
     def test_image_at_start(self):
         """Image at position 0 should need no pre-padding."""
@@ -163,11 +178,13 @@ class TestPadForBlockAlignment:
         text = _txt(5)
         tokens = img + text
         raw_ranges = _compute_image_token_ranges(tokens, [0x1])
-        padded, pranges = _pad_for_block_alignment(tokens, raw_ranges, BLOCK)
+        padded, pranges, postpad_ranges = _pad_for_block_alignment(tokens, raw_ranges, BLOCK)
 
         start, end, _ = pranges[0]
         assert start == 0  # no pre-padding needed
         assert end == BLOCK
+        # Image is exactly BLOCK tokens, no post-padding.
+        assert postpad_ranges == []
 
     def test_image_at_end(self):
         """Image at the end with post-padding still aligns."""
@@ -175,12 +192,17 @@ class TestPadForBlockAlignment:
         img = _img(20)
         tokens = text + img
         raw_ranges = _compute_image_token_ranges(tokens, [0x2])
-        padded, pranges = _pad_for_block_alignment(tokens, raw_ranges, BLOCK)
+        padded, pranges, postpad_ranges = _pad_for_block_alignment(tokens, raw_ranges, BLOCK)
 
         start, end, _ = pranges[0]
         assert start % BLOCK == 0
         assert end % BLOCK == 0
         assert end == len(padded)  # nothing after image (including padding)
+        # 20 image tokens → last block has 4 real + 12 post-pad.
+        assert len(postpad_ranges) == 1
+        ps, pe = postpad_ranges[0]
+        assert ps == start + 20   # real image ends after 20 tokens
+        assert pe == end
 
 
 # ---- Sequence integration tests ---------------------------------------------
@@ -283,6 +305,87 @@ class TestBlockManagerImageReuse:
         bm.allocate(seq)
         assert len(seq.block_table) == seq.num_blocks
         Sequence.block_size = old_bs
+
+
+# ---- Postpad KV-slot masking tests ------------------------------------------
+
+class TestPostpadSlotMasking:
+    """Verify that image post-padding positions are tracked and that the
+    KV cache is equivalent before and after image-block reuse."""
+
+    @staticmethod
+    def _make_seq(token_ids, image_hashes=None, block_size=BLOCK):
+        old_bs = Sequence.block_size
+        Sequence.block_size = block_size
+        seq = Sequence(token_ids, image_hashes=image_hashes)
+        Sequence.block_size = old_bs
+        seq.block_size = block_size
+        return seq
+
+    def test_no_postpad_when_image_block_aligned(self):
+        """If the image length is already a multiple of block_size, there is no
+        post-padding and image_postpad_ranges must be empty."""
+        tokens = _txt(BLOCK) + _img(BLOCK)
+        seq = self._make_seq(tokens, image_hashes=[0xABC])
+        assert seq.image_postpad_ranges == []
+        assert seq.image_postpad_count == 0
+        assert seq.num_effective_tokens == seq.num_tokens
+
+    def test_postpad_tracked_correctly(self):
+        """Post-padding tokens at the end of the last image block are tracked."""
+        # 20 image tokens → last block has 4 real + 12 postpad (BLOCK=16)
+        tokens = _txt(BLOCK) + _img(20)
+        seq = self._make_seq(tokens, image_hashes=[0xDEF])
+        assert len(seq.image_postpad_ranges) == 1
+        ps, pe = seq.image_postpad_ranges[0]
+        assert pe - ps == BLOCK - 4   # 12 postpad tokens
+        assert seq.image_postpad_count == 12
+        assert seq.num_effective_tokens == seq.num_tokens - 12
+
+    def test_postpad_positions_in_last_image_block(self):
+        """Post-pad positions must fall at the end of the last image block."""
+        tokens = _txt(BLOCK) + _img(20)
+        seq = self._make_seq(tokens, image_hashes=[0xDEF])
+        # image_token_ranges[0] gives the padded range [16, 48)
+        img_start, img_end, _ = seq.image_token_ranges[0]
+        ps, pe = seq.image_postpad_ranges[0]
+        # Postpad is inside the image range and at its very end.
+        assert img_start <= ps < pe == img_end
+        # All tokens in postpad range should be PAD_TOKEN_ID.
+        for pos in range(ps, pe):
+            assert seq.token_ids[pos] == PAD_TOKEN_ID, (
+                f"Expected PAD at position {pos}, got {seq.token_ids[pos]}"
+            )
+
+    def test_two_images_postpad(self):
+        """Each image with non-aligned length produces its own postpad range."""
+        # img1: 20 tokens → postpad 12;  img2: 18 tokens → postpad 14
+        tokens = _txt(BLOCK) + _img(20) + _txt(5, 100) + _img(18)
+        seq = self._make_seq(tokens, image_hashes=[0xA, 0xB])
+        assert len(seq.image_postpad_ranges) == 2
+        # First image postpad.
+        ps1, pe1 = seq.image_postpad_ranges[0]
+        assert pe1 - ps1 == BLOCK - 4   # 12
+        # Second image postpad.
+        ps2, pe2 = seq.image_postpad_ranges[1]
+        assert pe2 - ps2 == BLOCK - 2   # 14
+        assert seq.image_postpad_count == 12 + 14
+
+    def test_num_effective_tokens_no_images(self):
+        """Text-only sequences have no postpad; effective == total tokens."""
+        tokens = _txt(30)
+        seq = self._make_seq(tokens)
+        assert seq.image_postpad_ranges == []
+        assert seq.num_effective_tokens == len(seq)
+
+    def test_serialization_preserves_postpad_ranges(self):
+        """image_postpad_ranges survives a __getstate__ / __setstate__ round-trip."""
+        tokens = _txt(BLOCK) + _img(20)
+        seq = self._make_seq(tokens, image_hashes=[0x123])
+        serialized = pickle.dumps(seq.__getstate__())
+        restored = Sequence.__new__(Sequence)
+        restored.__setstate__(pickle.loads(serialized))
+        assert restored.image_postpad_ranges == seq.image_postpad_ranges
 
 
 # ---- run with pytest --------------------------------------------------------
