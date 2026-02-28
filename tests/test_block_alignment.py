@@ -3,7 +3,7 @@ import sys
 import os
 import importlib.util
 
-# ---- direct file-based imports (avoids nanovllm/__init__.py & heavy deps) ----
+# ---- direct file-based imports (avoids nanovllm/__init__.py & heavy dependencies) ----
 _ROOT = os.path.join(os.path.dirname(__file__), "..")
 
 def _load_module(name, relpath):
@@ -147,12 +147,12 @@ class TestPadForBlockAlignment:
         tokens = img1 + img2
         raw_ranges = _compute_image_token_ranges(tokens, [0xA, 0xB])
 
-        # _compute_image_token_ranges sees one contiguous run of IMAGE_TOKEN_IDs;
-        # but with two hashes, only the first run consumes both hashes.
-        # Actually, because all IMAGE_TOKEN_IDs are the same, the scanner sees ONE
-        # run of 32 tokens.  Only 1 range is produced (consuming hash 0xA).
-        # This is a limitation of the scanner.  We still verify padding is correct.
+        # _compute_image_token_ranges sees one contiguous run of IMAGE_TOKEN_IDs
+        # (all the same token value), so it produces only 1 range consuming hash 0xA.
+        assert len(raw_ranges) == 1
+
         padded, pranges = _pad_for_block_alignment(tokens, raw_ranges, BLOCK)
+        assert len(pranges) == 1
         for s, e, _ in pranges:
             assert s % BLOCK == 0
             assert e % BLOCK == 0

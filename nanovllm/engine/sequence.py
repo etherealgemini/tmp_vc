@@ -12,7 +12,9 @@ IMAGE_TOKEN_ID = 151655
 PAD_TOKEN_ID = 0
 
 
-def _pad_for_block_alignment(token_ids: list, image_token_ranges: list, block_size: int) -> tuple:
+def _pad_for_block_alignment(
+    token_ids: list, image_token_ranges: list, block_size: int,
+) -> tuple[list[int], list[tuple[int, int, int]]]:
     """Pad *token_ids* so that each image's tokens occupy dedicated, complete blocks.
 
     Padding tokens (``PAD_TOKEN_ID``) are inserted:
