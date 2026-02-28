@@ -8,6 +8,61 @@ from nanovllm.sampling_params import SamplingParams
 # Token ID used for image placeholder tokens in Qwen2.5-VL sequences.
 IMAGE_TOKEN_ID = 151655
 
+# Padding token used to align image boundaries to block boundaries.
+PAD_TOKEN_ID = 0
+
+
+def _pad_for_block_alignment(
+    token_ids: list, image_token_ranges: list, block_size: int,
+) -> tuple[list[int], list[tuple[int, int, int]]]:
+    """Pad *token_ids* so that each image's tokens occupy dedicated, complete blocks.
+
+    Padding tokens (``PAD_TOKEN_ID``) are inserted:
+
+    * **before** each image – to push the image start to the next block boundary,
+    * **after** each image – to fill the remainder of the last image block.
+
+    This guarantees that every KV-cache block that falls inside an image range
+    contains *only* tokens from that single image (plus deterministic padding),
+    enabling position-agnostic cross-request reuse of image KV blocks.
+
+    Returns ``(padded_token_ids, padded_image_token_ranges)`` where the ranges
+    are adjusted to the new, block-aligned positions.
+    """
+    if not image_token_ranges:
+        return list(token_ids), []
+
+    padded: list[int] = []
+    padded_ranges: list[tuple[int, int, int]] = []
+    src = 0  # next uncopied position in the original token_ids
+
+    for img_start, img_end, img_hash in image_token_ranges:
+        # --- text segment preceding this image ---
+        padded.extend(token_ids[src:img_start])
+
+        # Pad text segment to the next block boundary so the image starts clean.
+        remainder = len(padded) % block_size
+        if remainder != 0:
+            padded.extend([PAD_TOKEN_ID] * (block_size - remainder))
+
+        # --- image segment ---
+        p_img_start = len(padded)
+        padded.extend(token_ids[img_start:img_end])
+
+        # Pad image segment to fill the last block completely.
+        remainder = len(padded) % block_size
+        if remainder != 0:
+            padded.extend([PAD_TOKEN_ID] * (block_size - remainder))
+
+        p_img_end = len(padded)
+        padded_ranges.append((p_img_start, p_img_end, img_hash))
+        src = img_end
+
+    # --- remaining text after the last image ---
+    padded.extend(token_ids[src:])
+
+    return padded, padded_ranges
+
 
 def _compute_image_token_ranges(token_ids: list, image_hashes: list) -> list:
     """Return [(start, end, hash), ...] for each image's consecutive token run.
@@ -63,6 +118,16 @@ class Sequence:
             _compute_image_token_ranges(token_ids, image_hashes)
             if image_hashes else []
         )
+
+        # Pad token_ids so that every image occupies dedicated, complete blocks.
+        # This ensures image KV-cache blocks contain only a single image's tokens,
+        # enabling cross-request reuse regardless of surrounding text.
+        if self.image_token_ranges:
+            self.token_ids, self.image_token_ranges = _pad_for_block_alignment(
+                self.token_ids, self.image_token_ranges, self.block_size,
+            )
+            self.num_tokens = len(self.token_ids)
+            self.num_prompt_tokens = self.num_tokens
 
         # Block indices (within this sequence's block_table) that were reused from
         # the KV cache via image-content hash even though the text prefix before
