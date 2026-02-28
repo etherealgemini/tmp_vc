@@ -153,6 +153,7 @@ class ModelRunner:
         block_tables = None
         mm_inputs = {"pixel_values": [], "image_grid_thw": [], "image_hashes": []}
         has_multimodal = False
+        has_image_reused = False  # any sequence has non-contiguous image KV reuse
         for seq in seqs:
             seqlen = len(seq)
             input_ids.extend(seq[seq.num_cached_tokens:])
@@ -187,14 +188,25 @@ class ModelRunner:
                     mm_inputs["image_hashes"].extend(hashes)
             if not seq.block_table:    # warmup
                 continue
+            image_reused = seq.image_reused_blocks
+            if image_reused:
+                has_image_reused = True
             for i in range(seq.num_cached_blocks, seq.num_blocks):
                 start = seq.block_table[i] * self.block_size
                 if i != seq.num_blocks - 1:
                     end = start + self.block_size
                 else:
-                    end = start + seq.last_block_num_tokens 
-                slot_mapping.extend(list(range(start, end)))
-        if cu_seqlens_k[-1] > cu_seqlens_q[-1]:    # prefix cache
+                    end = start + seq.last_block_num_tokens
+                if i in image_reused:
+                    # Image KV already in cache from a prior request with the same
+                    # image content.  Use -1 sentinel so store_kvcache skips these
+                    # slots and the cached KV values are preserved for attention.
+                    slot_mapping.extend([-1] * (end - start))
+                else:
+                    slot_mapping.extend(list(range(start, end)))
+        # Need block_tables whenever there is a contiguous prefix cache OR
+        # non-contiguous image KV reuse (so attention reads from the paged cache).
+        if cu_seqlens_k[-1] > cu_seqlens_q[-1] or has_image_reused:
             block_tables = self.prepare_block_tables(seqs)
 
         if has_multimodal:

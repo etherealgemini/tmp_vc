@@ -58,28 +58,86 @@ class BlockManager:
 
     def allocate(self, seq: Sequence):
         assert not seq.block_table
-        h = seq.image_hash if seq.image_hash is not None else -1
-        cache_miss = False
+        # Use -1 as the initial chain seed for text blocks.  Image blocks receive
+        # a position-agnostic seed derived from the image content hash so that the
+        # same image can be found in the KV cache regardless of what text precedes
+        # it in the sequence.
+        h = -1
+        text_cache_miss = False
+        image_reused_blocks: set = set()
+        image_token_ranges = getattr(seq, 'image_token_ranges', [])
+
         for i in range(seq.num_blocks):
+            block_start = i * self.block_size
             token_ids = seq.block(i)
-            h = self.compute_hash(token_ids, h) if len(token_ids) == self.block_size else -1
-            block_id = self.hash_to_block_id.get(h, -1)
-            if block_id == -1 or self.blocks[block_id].token_ids != token_ids:
-                cache_miss = True
-            if cache_miss:
-                block_id = self.free_block_ids[0]
-                block = self._allocate_block(block_id)
+            full_block = len(token_ids) == self.block_size
+
+            # --- Determine whether this is a pure-image block ---
+            # A block qualifies when it is a full block whose entire token range
+            # falls within one image's token range.
+            img_content_hash = None
+            is_first_of_image = False
+            if full_block and image_token_ranges:
+                block_end = block_start + self.block_size
+                for (img_start, img_end, img_hash) in image_token_ranges:
+                    if block_start >= img_start and block_end <= img_end:
+                        img_content_hash = img_hash
+                        is_first_of_image = (block_start == img_start)
+                        break
+
+            # --- Compute this block's hash ---
+            if img_content_hash is not None:
+                # Image block: reset chain to the image content hash at the start
+                # of each image so that the hash is independent of the text prefix.
+                if is_first_of_image:
+                    h = img_content_hash
+                h = self.compute_hash(token_ids, h)
             else:
+                h = self.compute_hash(token_ids, h) if full_block else -1
+
+            # --- Cache lookup ---
+            # h == -1 is the "no hash" sentinel; xxhash intdigest() is always >= 0,
+            # so hash_to_block_id will never contain -1 as a key.
+            block_id = self.hash_to_block_id.get(h, -1)
+            cache_hit = block_id != -1 and self.blocks[block_id].token_ids == token_ids
+
+            if img_content_hash is not None:
+                # Image block: attempt reuse regardless of text prefix cache state.
+                if cache_hit:
+                    if text_cache_miss:
+                        # Non-contiguous image KV reuse: text prefix before the
+                        # image missed, but the image block itself is cached.
+                        image_reused_blocks.add(i)
+                    else:
+                        seq.num_cached_tokens += self.block_size
+                    if block_id in self.used_block_ids:
+                        block = self.blocks[block_id]
+                        block.ref_count += 1
+                    else:
+                        block = self._allocate_block(block_id)
+                else:
+                    block_id = self.free_block_ids[0]
+                    block = self._allocate_block(block_id)
+            elif cache_hit and not text_cache_miss:
+                # Normal text prefix cache hit.
                 seq.num_cached_tokens += self.block_size
                 if block_id in self.used_block_ids:
                     block = self.blocks[block_id]
                     block.ref_count += 1
                 else:
                     block = self._allocate_block(block_id)
+            else:
+                # Text block miss.
+                text_cache_miss = True
+                block_id = self.free_block_ids[0]
+                block = self._allocate_block(block_id)
+
             if h != -1:
                 block.update(h, token_ids)
                 self.hash_to_block_id[h] = block_id
             seq.block_table.append(block_id)
+
+        seq.image_reused_blocks = image_reused_blocks
 
     def deallocate(self, seq: Sequence):
         for block_id in reversed(seq.block_table):
@@ -89,6 +147,7 @@ class BlockManager:
                 self._deallocate_block(block_id)
         seq.num_cached_tokens = 0
         seq.block_table.clear()
+        seq.image_reused_blocks.clear()
 
     def can_append(self, seq: Sequence) -> bool:
         return len(self.free_block_ids) >= (len(seq) % self.block_size == 1)
@@ -107,7 +166,7 @@ class BlockManager:
             if len(block_table) > 1:
                 prefix = self.blocks[block_table[-2]].hash
             else:
-                prefix = seq.image_hash if seq.image_hash is not None else -1
+                prefix = -1
             h = self.compute_hash(token_ids, prefix)
             last_block.update(h, token_ids)
             self.hash_to_block_id[h] = last_block.block_id
